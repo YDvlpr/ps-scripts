@@ -1,0 +1,16 @@
+$rules = @(
+    # Block credential stealing
+    "3B576869-A4EC-4529-8536-B80A7769E899", 
+    # Block Office child processes
+    "D4F940AB-401B-4EFC-AADC-AD5F3C50688A", 
+    # Block Office creating executable content
+    "75668C1F-73B5-4CF0-BB93-3ECF5CB7CC84", 
+    # Block Win32 API calls from Office
+    "26190899-1602-49E8-8B27-EB1D0A1CE869",
+    # Block credential stealing from LSASS
+    "9E6BEB4A-ED94-4A4F-ACB5-787B8D8F7934"
+)
+
+foreach ($rule in $rules) {
+    Add-MpPreference -AttackSurfaceReductionRules_Ids $rule -AttackSurfaceReductionRules_Actions Enabled
+}
