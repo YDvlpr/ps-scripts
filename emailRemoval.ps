@@ -1,0 +1,55 @@
+# Target Gmail account to remove
+$targetEmail = "haydonlord9@gmail.com"
+
+Write-Host "=== Removing account: $targetEmail ===`n"
+
+function Remove-IfMatch {
+    param([string]$Path,[string]$Why)
+    try {
+        $props = Get-ItemProperty -LiteralPath $Path -ErrorAction Stop
+        $allText = $props.PSObject.Properties.Value -join "`n"
+        $allText += "`n" + (Split-Path -Leaf $Path)
+        if ($allText -match [regex]::Escape($targetEmail)) {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            Write-Host "[REMOVED] $Why:`n  $Path`n"
+        }
+    } catch {}
+}
+
+# 1) IdentityCRL: StoredIdentities
+$stored = "HKCU:\Software\Microsoft\IdentityCRL\StoredIdentities"
+if (Test-Path $stored) {
+    Get-ChildItem $stored | ForEach-Object { Remove-IfMatch $_.PsPath "IdentityCRL\StoredIdentities" }
+}
+
+# 2) IdentityCRL: UserExtendedProperties
+$uxp = "HKCU:\Software\Microsoft\IdentityCRL\UserExtendedProperties"
+if (Test-Path $uxp) {
+    Get-ChildItem $uxp | ForEach-Object { Remove-IfMatch $_.PsPath "IdentityCRL\UserExtendedProperties" }
+}
+
+# 3) Web Account Manager (WAM)
+$wam = "HKCU:\Software\Microsoft\Windows\CurrentVersion\WebAccountManager\Accounts"
+if (Test-Path $wam) {
+    Get-ChildItem $wam | ForEach-Object { Remove-IfMatch $_.PsPath "WAM Account" }
+}
+
+# 4) Credential Manager cleanup
+$targets = (cmdkey /list) 2>$null
+if ($targets) {
+    $lines = $targets -split "`r?`n" | Where-Object { $_ -match '^\s*Target:' }
+    foreach ($line in $lines) {
+        $target = ($line -replace '^\s*Target:\s*','').Trim()
+        if ($target -like "*$targetEmail*") {
+            cmdkey /delete:$target | Out-Null
+            Write-Host "[REMOVED] Credential: $target"
+        }
+    }
+}
+
+Write-Host "`nDone. Opening Settings so you can check..."
+Start-Process "ms-settings:emailandaccounts"
+Start-Process "ms-settings:workplace"
+
+$ans = Read-Host "Restart now to finalize? (Y/N)"
+if ($ans -match '^[Yy]') { Restart-Computer -Force }
