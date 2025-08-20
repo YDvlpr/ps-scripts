@@ -1,59 +1,109 @@
-# Target Gmail account to remove
+# === CONFIG ===
 $targetEmail = "haydonlord9@gmail.com"
+Write-Host "Targeting: $targetEmail`n"
 
-Write-Host "=== Removing account: $targetEmail ===`n"
+# === Helper: export backups of the relevant hives (so you can undo if needed) ===
+$backup = Join-Path $env:TEMP ("GmailUnlinkBackup_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
+New-Item -ItemType Directory -Force -Path $backup | Out-Null
+cmd /c "reg export HKCU\Software\Microsoft\IdentityCRL `"$backup\IdentityCRL.reg`" /y" | Out-Null
+cmd /c "reg export HKCU\Software\Microsoft\Windows\CurrentVersion\WebAccountManager `"$backup\WAM.reg`" /y" | Out-Null
+cmd /c "reg export HKCU\Software\Microsoft\Windows\CurrentVersion\CloudStore `"$backup\CloudStore.reg`" /y" | Out-Null
+Write-Host "Backed up registry to: $backup`n"
 
-function Remove-IfMatch {
+# === Helper: safe remove if path exists ===
+function Remove-KeyIfContains {
     param([string]$Path,[string]$Why)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
     try {
         $props = Get-ItemProperty -LiteralPath $Path -ErrorAction Stop
-        $allText = ($props.PSObject.Properties.Value -join "`n")
-        $allText += "`n" + (Split-Path -Leaf $Path)
-        if ($allText -match [regex]::Escape($targetEmail)) {
+        $blob  = ($props.PSObject.Properties.Value -join "`n") + "`n" + (Split-Path -Leaf $Path)
+        if ($blob -match [regex]::Escape($targetEmail)) {
             Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
-            Write-Host "[REMOVED] $($Why):`n  $Path`n"
+            Write-Host "[REMOVED] $Why`n  $Path`n"
         }
-    } catch {}
+    } catch {
+        # some values are binary; we’ll handle via deep scan below
+    }
 }
 
-# 1) IdentityCRL: StoredIdentities
+# === 1) IdentityCRL (classic app-linked identities) ===
 $stored = "HKCU:\Software\Microsoft\IdentityCRL\StoredIdentities"
-if (Test-Path $stored) {
-    # direct hit if the key is named like the email
-    $direct = Join-Path $stored $targetEmail
-    if (Test-Path $direct) { Remove-Item -LiteralPath $direct -Recurse -Force -ErrorAction SilentlyContinue; Write-Host "[REMOVED] StoredIdentities:`n  $direct`n" }
-    Get-ChildItem -LiteralPath $stored | ForEach-Object { Remove-IfMatch $_.PsPath "IdentityCRL\StoredIdentities" }
+$uxp    = "HKCU:\Software\Microsoft\IdentityCRL\UserExtendedProperties"
+$direct = Join-Path $stored $targetEmail
+if (Test-Path $direct) { Remove-Item -LiteralPath $direct -Recurse -Force -ErrorAction SilentlyContinue; Write-Host "[REMOVED] StoredIdentities direct key:`n  $direct`n" }
+if (Test-Path $stored) { Get-ChildItem -LiteralPath $stored | ForEach-Object { Remove-KeyIfContains $_.PsPath "IdentityCRL\StoredIdentities" } }
+if (Test-Path $uxp)    { Get-ChildItem -LiteralPath $uxp    | ForEach-Object { Remove-KeyIfContains $_.PsPath "IdentityCRL\UserExtendedProperties" } }
+
+# === 2) WAM (Web Account Manager) Accounts + Tokens ===
+$wamA = "HKCU:\Software\Microsoft\Windows\CurrentVersion\WebAccountManager\Accounts"
+$wamT = "HKCU:\Software\Microsoft\Windows\CurrentVersion\WebAccountManager\Tokens"
+if (Test-Path $wamA) { Get-ChildItem -LiteralPath $wamA | ForEach-Object { Remove-KeyIfContains $_.PsPath "WAM Account" } }
+if (Test-Path $wamT) { Get-ChildItem -LiteralPath $wamT | ForEach-Object { Remove-KeyIfContains $_.PsPath "WAM Token" } }
+
+# === 3) CloudStore (where Windows 10 Mail/People cache accounts) ===
+# We'll scan the DefaultAccount cache for keys that either have the email in their name
+# or have binary blobs containing the email when decoded as text.
+$cloudBase = "HKCU:\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\Cache\DefaultAccount"
+if (Test-Path $cloudBase) {
+    $toRemove = @()
+    foreach ($k in Get-ChildItem -LiteralPath $cloudBase -Recurse -ErrorAction SilentlyContinue) {
+        $hit = $false
+        # name hit
+        if ($k.PSChildName -like "*$targetEmail*") { $hit = $true }
+        # data hit
+        if (-not $hit) {
+            try {
+                $valNames = (Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction Stop).PSObject.Properties |
+                            Where-Object { $_.Name -notmatch '^PS(Path|ParentPath|ChildName|Drive|Provider)$' } |
+                            Select-Object -ExpandProperty Name
+                foreach ($vn in $valNames) {
+                    $v = (Get-ItemPropertyValue -LiteralPath $k.PSPath -Name $vn -ErrorAction SilentlyContinue)
+                    if ($null -ne $v) {
+                        # values can be strings or byte[]; turn byte[] into UTF8/Unicode/ASCII text to search
+                        $texts = @()
+                        if ($v -is [byte[]]) {
+                            $texts += [System.Text.Encoding]::UTF8.GetString($v)
+                            $texts += [System.Text.Encoding]::Unicode.GetString($v)
+                            $texts += [System.Text.Encoding]::ASCII.GetString($v)
+                        } else {
+                            $texts += [string]$v
+                        }
+                        if ($texts -join "`n" -match [regex]::Escape($targetEmail)) { $hit = $true; break }
+                    }
+                }
+            } catch {}
+        }
+        if ($hit) { $toRemove += $k.PSPath }
+    }
+    $toRemove = $toRemove | Sort-Object -Unique
+    foreach ($p in $toRemove) {
+        try { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction Stop; Write-Host "[REMOVED] CloudStore:`n  $p" } catch {}
+    }
+    if ($toRemove.Count -gt 0) { Write-Host "" }
 }
 
-# 2) IdentityCRL: UserExtendedProperties
-$uxp = "HKCU:\Software\Microsoft\IdentityCRL\UserExtendedProperties"
-if (Test-Path $uxp) {
-    Get-ChildItem -LiteralPath $uxp | ForEach-Object { Remove-IfMatch $_.PsPath "IdentityCRL\UserExtendedProperties" }
-}
-
-# 3) Web Account Manager (WAM)
-$wam = "HKCU:\Software\Microsoft\Windows\CurrentVersion\WebAccountManager\Accounts"
-if (Test-Path $wam) {
-    Get-ChildItem -LiteralPath $wam | ForEach-Object { Remove-IfMatch $_.PsPath "WAM Account" }
-}
-
-# 4) Credential Manager cleanup
+# === 4) Credential Manager entries (Web creds that can re-add the account) ===
 $targets = (cmdkey /list) 2>$null
 if ($targets) {
-    $targets -split "`r?`n" |
-      Where-Object { $_ -match '^\s*Target:' } |
-      ForEach-Object {
-        $t = ($_ -replace '^\s*Target:\s*','').Trim()
-        if ($t -like "*$targetEmail*") {
-            cmdkey /delete:$t | Out-Null
-            Write-Host "[REMOVED] Credential: $t"
-        }
+  $targets -split "`r?`n" |
+    Where-Object { $_ -match '^\s*Target:' } |
+    ForEach-Object {
+      $t = ($_ -replace '^\s*Target:\s*','').Trim()
+      if ($t -like "*$targetEmail*") {
+        cmdkey /delete:$t | Out-Null
+        Write-Host "[REMOVED] Credential: $t"
       }
+    }
 }
 
-Write-Host "`nDone. Opening Settings so you can check..."
+# === 5) Kill background processes that cache auth ===
+"HxTsr","HxOutlook","HxCalendarAppImm","HxMail","WWAHost","WinStore.App","WinStore.Mobile" |
+  ForEach-Object { Stop-Process -Name $_ -Force -ErrorAction SilentlyContinue }
+
+Write-Host "`nOpening the Settings pages so you can verify..."
 Start-Process "ms-settings:emailandaccounts"
 Start-Process "ms-settings:workplace"
 
 $ans = Read-Host "Restart now to finalize? (Y/N)"
 if ($ans -match '^[Yy]') { Restart-Computer -Force }
+else { Write-Host "Please reboot soon to flush WAM/CloudStore caches." }
